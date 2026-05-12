@@ -36,28 +36,49 @@ async function handleDecryptionError(remoteJid, error) {
       `🔑 Decryption error for ${remoteJid} (count: ${errorCount + 1}): ${error.message}`
     );
 
-    // If we have too many decryption errors for this contact, clear their session
-    if (errorCount > 5) {
-      logger.warn(`🔑 Too many decryption errors for ${remoteJid}, clearing session data`);
+    const ownJid = sock?.user?.id?.split(":")?.[0];
+    const remoteNumber = normalizeJidNumber(remoteJid);
+    const ownNumber = normalizeJidNumber(ownJid);
 
-      // Clear session files for this specific contact
-      const sessionPath = path.join(process.cwd(), "session");
-      const sessionFiles = await fs.readdir(sessionPath);
+    // If errors are for the bot's own number, recover immediately.
+    const shouldForceRecovery = Boolean(remoteNumber && ownNumber && remoteNumber === ownNumber);
+    const shouldRecover = shouldForceRecovery || errorCount >= 2;
 
-      for (const file of sessionFiles) {
-        if (file.includes(remoteJid.replace("@", "").replace(".", ""))) {
-          const filePath = path.join(sessionPath, file);
-          await fs.remove(filePath);
-          logger.info(`🗑️ Removed session file: ${file}`);
-        }
-      }
-
-      // Reset error count
+    if (shouldRecover) {
+      logger.warn(
+        `🔑 Recovering Signal sessions for ${remoteJid} after ${errorCount + 1} decrypt error(s)`
+      );
+      const removed = await purgeSessionFilesForJid(remoteJid);
+      logger.info(`🗑️ Removed ${removed} corrupted session file(s) for ${remoteJid}`);
       decryptionErrors.delete(remoteJid);
     }
   } catch (err) {
     logger.error("❌ Error handling decryption error:", err);
   }
+}
+
+function normalizeJidNumber(jid = "") {
+  const base = String(jid).split("@")[0];
+  return base.split(":")[0].replace(/\D/g, "");
+}
+
+async function purgeSessionFilesForJid(jid) {
+  const sessionPath = path.join(process.cwd(), "session");
+  const sessionFiles = await fs.readdir(sessionPath);
+  const targetNumber = normalizeJidNumber(jid);
+  if (!targetNumber) return 0;
+
+  let removedCount = 0;
+  for (const file of sessionFiles) {
+    // session-254702047436.0.json -> 254702047436
+    if (!file.startsWith("session-") || !file.endsWith(".json")) continue;
+    const fileNumber = file.replace(/^session-/, "").split(".")[0].replace(/\D/g, "");
+    if (fileNumber !== targetNumber) continue;
+
+    await fs.remove(path.join(sessionPath, file));
+    removedCount++;
+  }
+  return removedCount;
 }
 
 // Clean up old decryption errors (reset every hour)
@@ -186,7 +207,13 @@ async function startConnection(phoneNumber = null, resolve, reject) {
         }
       },
       shouldIgnoreJid: (jid) => {
-        // Ignore problematic JIDs that cause decryption errors
+        // Ignore self/newsletter traffic and problematic JIDs causing decrypt errors.
+        const normalized = normalizeJidNumber(jid);
+        const ownNumber = normalizeJidNumber(sock?.user?.id?.split(":")?.[0] || "");
+        if (jid?.endsWith("@newsletter")) return true;
+        if (normalized && ownNumber && normalized === ownNumber) return true;
+
+        // Fallback: ignore JIDs with repeated decryption errors.
         const errorCount = decryptionErrors.get(jid) || 0;
         return errorCount > 10;
       },
@@ -344,33 +371,35 @@ async function startConnection(phoneNumber = null, resolve, reject) {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // Add session monitoring
-    sock.ev.on("connection.update", (update) => {
-      const { connection, lastDisconnect } = update;
-
-      if (connection === "close") {
-        const shouldReconnect =
-          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-
-        if (shouldReconnect) {
-          logger.info("🔄 Connection lost, attempting to reconnect...");
-          setTimeout(() => {
-            process.exit(2); // Exit with restart code
-          }, 2000);
-        } else {
-          logger.error("❌ Logged out from WhatsApp, please re-authenticate");
-          process.exit(1);
-        }
-      }
-    });
+    // NOTE: do not register another force-exit connection.update listener here.
+    // Reconnect behavior is already handled in the primary listener above.
 
     sock.ev.on("messages.upsert", async (m) => {
       try {
         if (!global.GoatBot.isConnected) return;
 
         const msg = m.messages[0];
-        if (!msg?.message || msg.key.fromMe) return;
-        if (config.antiInbox && !msg.key.remoteJid.endsWith("@g.us")) return;
+        if (!msg?.message) {
+          logger.debug("Skipping upsert: missing message payload");
+          return;
+        }
+        const messageType = Object.keys(msg.message || {})[0] || "unknown";
+        if (messageType === "protocolMessage") {
+          logger.debug(`Skipping upsert: protocolMessage for ${msg.key.remoteJid}`);
+          return;
+        }
+        if (msg.key.fromMe && !config.allowSelfMessages) {
+          logger.info(`Skipping upsert: fromMe blocked for ${msg.key.remoteJid}`);
+          return;
+        }
+        if (config.antiInbox && !msg.key.remoteJid.endsWith("@g.us")) {
+          logger.info(`Skipping upsert: antiInbox enabled for ${msg.key.remoteJid}`);
+          return;
+        }
+
+        logger.info(
+          `Upsert accepted: jid=${msg.key.remoteJid}, fromMe=${Boolean(msg.key.fromMe)}, type=${messageType}`
+        );
 
         global.GoatBot.stats.messagesProcessed++;
 

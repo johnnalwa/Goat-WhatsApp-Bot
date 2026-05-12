@@ -14,6 +14,7 @@ const DataUtils = require("../libs/dataUtils");
 const MessageWrapper = require("../libs/messageWrapper");
 const APIWrapper = require("../libs/apiWrapper");
 const jsonDB = require("../database/json");
+const anonchat = require("../libs/anonchat");
 
 // Simple in-memory cooldown map per command
 const cooldowns = new Map();
@@ -35,23 +36,44 @@ module.exports = async function handleMessage({ sock, event, msg, config, db, lo
     const sender = getUserId(rawMsg);
     const threadId = getThreadId(rawMsg);
     const isGroup = isGroupMessage(rawMsg);
-    const body =
-      rawMsg.message?.conversation ||
-      rawMsg.message?.extendedTextMessage?.text ||
-      rawMsg.message?.imageMessage?.caption ||
-      rawMsg.message?.videoMessage?.caption ||
-      "";
+    const messageContent = unwrapMessageContent(rawMsg.message);
+    const body = extractTextFromMessageContent(messageContent);
     const timestamp = rawMsg.messageTimestamp;
+
+    // Peer relay: plain-text DMs between matched strangers (before logging / admin-report flows)
+    if (
+      config.anonchat?.enabled !== false &&
+      !isGroup &&
+      body &&
+      config.prefix &&
+      !body.startsWith(config.prefix)
+    ) {
+      const relayed = await anonchat.relayIfPaired({
+        sock,
+        sender,
+        body,
+        config,
+        db,
+        logger,
+      });
+      if (relayed) return;
+    }
+
+    const isAnonymousCommand = isPrivacySensitiveAnonymousCommand(body, config.prefix, sender, threadId);
+    const bodyForStorage = isAnonymousCommand ? "[anonymous message redacted]" : body;
+    const senderForStorage = isAnonymousCommand ? "[anonymous]" : sender;
 
     // Persist metadata
     await Promise.all([
       storeUserData(db, sender, rawMsg, isGroup),
       storeThreadData(db, threadId, rawMsg, isGroup),
-      storeMessageData(db, rawMsg.key.id, rawMsg, body, sender, threadId, timestamp),
+      storeMessageData(db, rawMsg.key.id, rawMsg, bodyForStorage, senderForStorage, threadId, timestamp, {
+        redactRaw: isAnonymousCommand,
+      }),
       addExperienceForMessage(sender, db),
     ]);
 
-    logger.info(`📨 Received from ${sender}${isGroup ? " (group)" : ""}: "${body}"`);
+    logger.info(`📨 Received from ${senderForStorage}${isGroup ? " (group)" : ""}: "${bodyForStorage}"`);
 
     // Prepare helpers
     const user = makeUserHelpers(sender, threadId, rawMsg, sock, db, config, logger);
@@ -111,6 +133,7 @@ module.exports = async function handleMessage({ sock, event, msg, config, db, lo
               config,
               db,
               logger,
+              event: eventData,
             })
           );
       }
@@ -132,10 +155,11 @@ module.exports = async function handleMessage({ sock, event, msg, config, db, lo
               config,
               db,
               logger,
+              event: eventData,
             })
           );
       }
-      const ctx = rawMsg.message.extendedTextMessage?.contextInfo;
+      const ctx = messageContent?.extendedTextMessage?.contextInfo;
       const quoted = ctx?.quotedMessage;
       if (quoted && ctx.participant) {
         const botId = sock.user?.id?.split(":")[0];
@@ -239,6 +263,59 @@ module.exports = async function handleMessage({ sock, event, msg, config, db, lo
   }
 };
 
+function unwrapMessageContent(message) {
+  let content = message;
+  let guard = 0;
+
+  // WhatsApp can wrap real payload inside ephemeral/viewOnce wrappers.
+  while (content && guard < 5) {
+    if (content.ephemeralMessage?.message) {
+      content = content.ephemeralMessage.message;
+      guard++;
+      continue;
+    }
+    if (content.viewOnceMessage?.message) {
+      content = content.viewOnceMessage.message;
+      guard++;
+      continue;
+    }
+    if (content.viewOnceMessageV2?.message) {
+      content = content.viewOnceMessageV2.message;
+      guard++;
+      continue;
+    }
+    if (content.viewOnceMessageV2Extension?.message) {
+      content = content.viewOnceMessageV2Extension.message;
+      guard++;
+      continue;
+    }
+    if (content.documentWithCaptionMessage?.message) {
+      content = content.documentWithCaptionMessage.message;
+      guard++;
+      continue;
+    }
+    break;
+  }
+
+  return content || {};
+}
+
+function extractTextFromMessageContent(content) {
+  if (!content) return "";
+
+  return (
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
+    content.documentMessage?.caption ||
+    content.buttonsResponseMessage?.selectedDisplayText ||
+    content.listResponseMessage?.title ||
+    content.templateButtonReplyMessage?.selectedDisplayText ||
+    ""
+  );
+}
+
 // ---------- Data & Helper Functions ----------
 
 async function storeUserData(db, userId, msg, isGroup) {
@@ -274,7 +351,7 @@ async function storeThreadData(db, threadId, msg, isGroup) {
   await db.set(key, t);
 }
 
-async function storeMessageData(db, messageId, msg, body, sender, threadId, timestamp) {
+async function storeMessageData(db, messageId, msg, body, sender, threadId, timestamp, options = {}) {
   const key = `message_${messageId}`;
   const m = {
     id: messageId,
@@ -283,13 +360,31 @@ async function storeMessageData(db, messageId, msg, body, sender, threadId, time
     threadId,
     timestamp,
     type: getMessageType(msg),
-    raw: msg,
+    raw: options.redactRaw ? null : msg,
   };
   await db.set(key, m);
   const arr = (await db.get(`thread_messages_${threadId}`)) || [];
   arr.push(messageId);
   if (arr.length > 100) arr.shift();
   await db.set(`thread_messages_${threadId}`, arr);
+}
+
+function isPrivacySensitiveAnonymousCommand(body, prefix, sender, threadId) {
+  const sessions = global.GoatBot?.anonymousSessions;
+  if (sessions?.has(`${threadId}:${sender}`)) return true;
+  if (!body) return false;
+
+  const normalized = body.trim().toLowerCase();
+  if (["anonymous", "anon", "feedback", "report"].includes(normalized)) return true;
+  if (!prefix || !body.startsWith(prefix)) return false;
+
+  const commandName = body
+    .slice(prefix.length)
+    .trim()
+    .split(/ +/)[0]
+    ?.toLowerCase();
+
+  return ["anonymous", "anon", "feedback", "report"].includes(commandName);
 }
 
 function getMessageType(msg) {

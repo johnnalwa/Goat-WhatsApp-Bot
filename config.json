@@ -1,11 +1,17 @@
 {
   "botName": "GoatWpBot",
   "prefix": ".",
+  "anonchat": {
+    "enabled": true,
+    "maxMessageLength": 2000,
+    "strangerLabel": "Stranger"
+  },
+  "allowSelfMessages": true,
   "skipSync": true,
   "admins": ["8801000000000@s.whatsapp.net"],
   "dashboard": {
     "enabled": true,
-    "port": 3000,
+    "port": 3500,
     "adminPassword": "admin123",
     "sessionTimeout": 1800000,
     "refreshInterval": 3000,
